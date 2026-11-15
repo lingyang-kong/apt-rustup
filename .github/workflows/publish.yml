@@ -1,0 +1,126 @@
+name: Publish rustup APT archive
+
+on:
+  schedule:
+    - cron: '11 12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A running publication completes; GitHub coalesces pending runs by default.
+concurrency:
+  group: rustup-pages
+  cancel-in-progress: false
+
+env:
+  APT_BASE_URL: ${{ vars.APT_BASE_URL || 'https://lingyang-kong.github.io/apt-rustup' }}
+
+jobs:
+  poll:
+    runs-on: ubuntu-slim
+    outputs:
+      changed: ${{ steps.poll.outputs.changed }}
+      upstream: ${{ steps.poll.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Discover and check publication
+        id: poll
+        env:
+          PUBLISHED_MANIFEST_URL: ${{ format('{0}/releases.json', env.APT_BASE_URL) }}
+        run: |
+          upstream=$(scripts/discover-release.sh)
+          changed=$(scripts/poll-release.sh <<<"$upstream")
+          printf '%s=%s\n' 'changed' "$changed" 'upstream' "$upstream" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: poll
+    if: needs.poll.outputs.changed == 'true'
+    runs-on: ubuntu-22.04
+    env:
+      UPSTREAM_JSON: ${{ needs.poll.outputs.upstream }}
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - name: Install build dependencies
+        id: install
+        background: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential pkg-config libssl-dev liblzma-dev libcurl4-openssl-dev dpkg-dev apt-utils gnupg jq curl git ripgrep shellcheck
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+        background: true
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Restore build cache
+        id: cache
+        uses: actions/cache/restore@v4
+        background: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/target
+            .build/package-cache
+          key: rustup-build-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: rustup-build-${{ runner.os }}-
+      - wait: install
+      - name: Lint and test repository
+        id: checks
+        background: true
+        run: |
+          shellcheck --external-sources scripts/*.sh tests/*.sh
+          tests/test-repository.sh
+          tests/test-history.sh
+          tests/test-build-cache.sh
+      - wait: cache
+      - name: Build and test package
+        run: |
+          scripts/build-package.sh .build/output <<<"$UPSTREAM_JSON"
+          package=".build/output/$(jq --raw-output .package .build/output/build.json)"
+          tests/test-package.sh "$package"
+          tests/test-migration.sh "$package"
+      - name: Save build cache
+        id: save-cache
+        uses: actions/cache/save@v4
+        background: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/target
+            .build/package-cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - wait: checks
+      - name: Sign archive
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+          PREVIOUS_ARCHIVE_URL: ${{ env.APT_BASE_URL }}
+        run: scripts/sync-apt-repo.sh .build/output dist <<<"$UPSTREAM_JSON"
+      - name: Test archive in Jammy
+        run: tests/test-jammy.sh dist
+      - wait: pages
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - wait: save-cache
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-slim
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deploy
